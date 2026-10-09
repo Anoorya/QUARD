@@ -1,284 +1,216 @@
 """
-main.py  –  Hand Gesture + Voice Command Computer Controller
-Run with:  python main.py
-Press  Q  in the camera window to quit.
-Press  V  to toggle voice control on/off.
-Press  G  to toggle gesture control on/off.
+main.py  -  QUARD: control your computer with your hand and your voice.
+
+Run:   python main.py
+
+How the program is put together
+  main.py                the window loop: reads the camera, asks the two
+                         controllers what happened, hands the result to the HUD
+  gesture_controller.py  MediaPipe hand tracking  -> mouse / scroll / zoom
+  voice_controller.py    microphone + speech recognition (background thread)
+  ui.py                  everything that is drawn on screen
+
+Keys (in the camera window)
+  G      hand control on/off        V      voice control on/off
+  SPACE  pause / resume everything  H      show / hide the help screen
+  D      show live tuning numbers   Q      quit (Esc closes help, or quits)
+
+The app starts on the help screen with everything paused, so nothing moves your
+mouse until you press H or SPACE.
 """
 
-import cv2
-import numpy as np
-import time
-import threading
 import sys
+import time
+
+import cv2
 
 from gesture_controller import GestureController
 from voice_controller    import VoiceController
+from ui import Hud, W, H, ACCENT, GREEN, RED, VOICE
 
 # ─── CONFIG ─────────────────────────────────────────────────────────────────
-CAM_INDEX   = 0
+CAM_INDEX = 0          # try 1, 2 ... if you have several cameras
 CAM_W, CAM_H = 1280, 720
-FPS_CAP     = 30
+FPS_CAP   = 30
+WINDOW    = "QUARD - Hand + Voice Control"
 
-# HUD colour palette (BGR)
-CLR_BG      = (15,  15,  30)
-CLR_ACCENT  = (0,  200, 255)    # cyan
-CLR_GREEN   = (50, 220, 100)
-CLR_ORANGE  = (30, 160, 255)
-CLR_RED     = (50,  50, 230)
-CLR_WHITE   = (240, 240, 255)
-CLR_DIM     = (100, 100, 130)
-CLR_VOICE   = (200, 100, 255)   # purple for voice
-
-FONT        = cv2.FONT_HERSHEY_SIMPLEX
-FONT_BOLD   = cv2.FONT_HERSHEY_DUPLEX
+KEY_ESC, KEY_ENTER, KEY_SPACE = 27, 13, 32
 
 
-# ─── Gesture reference card ──────────────────────────────────────────────────
-GESTURE_GUIDE = [
-    ("☝️  Index only",    "Move Cursor"),
-    ("👌 Pinch Thumb+Idx","Left Click"),
-    ("✌️  2-finger touch","Double Click"),
-    ("✌️  2-finger slide","Scroll Up/Down"),
-    ("🤟 Thumb+Mid",      "Right Click"),
-    ("✊ Fist",           "Pause Control"),
-    ("🖐 Open Palm",      "Drag"),
-    ("🤲 Both Hands",     "Zoom In/Out"),
-]
-
-VOICE_GUIDE = [
-    '"click"',        '"right click"',
-    '"double click"', '"scroll up/down"',
-    '"zoom in/out"',  '"screenshot"',
-    '"minimize"',     '"maximize"',
-    '"close"',        '"copy/paste"',
-    '"volume up/down"','"mute"',
-    '"switch window"', '"press enter"',
-]
+def open_camera():
+    """Open the webcam, using DirectShow on Windows (faster start-up, honours resolution)."""
+    backend = cv2.CAP_DSHOW if sys.platform.startswith("win") else cv2.CAP_ANY
+    cap = cv2.VideoCapture(CAM_INDEX, backend)
+    if not cap.isOpened():
+        cap.release()
+        return None
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  CAM_W)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_H)
+    cap.set(cv2.CAP_PROP_FPS, FPS_CAP)
+    return cap
 
 
-def draw_rounded_rect(img, x, y, w, h, r, color, thickness=-1, alpha=1.0):
-    """Draw a filled or outlined rounded rectangle."""
-    overlay = img.copy()
-    cv2.rectangle(overlay, (x+r, y), (x+w-r, y+h), color, thickness)
-    cv2.rectangle(overlay, (x, y+r), (x+w, y+h-r), color, thickness)
-    for cx, cy in [(x+r, y+r), (x+w-r, y+r), (x+r, y+h-r), (x+w-r, y+h-r)]:
-        cv2.circle(overlay, (cx, cy), r, color, thickness)
-    if alpha < 1.0:
-        cv2.addWeighted(overlay, alpha, img, 1-alpha, 0, img)
-    else:
-        img[:] = overlay
+def fit_frame(frame):
+    """Centre-crop the camera image to 16:9 and scale it to the HUD size (W x H).
 
-
-def draw_hud(frame, gesture_label, voice_label, voice_listening,
-             gesture_on, voice_on, fps, frame_count):
+    The HUD layout is fixed, so every camera (640x480, 1080p ...) is made to fit it.
+    """
     h, w = frame.shape[:2]
-
-    # ── Semi-transparent overlay panels ─────────────────────────────────────
-    overlay = frame.copy()
-
-    # Top status bar
-    cv2.rectangle(overlay, (0, 0), (w, 56), (10, 10, 22), -1)
-
-    # Left panel (gesture guide)
-    cv2.rectangle(overlay, (0, 56), (260, h), (12, 12, 25), -1)
-
-    # Right panel (voice guide)
-    cv2.rectangle(overlay, (w-220, 56), (w, h), (12, 12, 25), -1)
-
-    # Bottom status bar
-    cv2.rectangle(overlay, (0, h-60), (w, h), (10, 10, 22), -1)
-
-    cv2.addWeighted(overlay, 0.82, frame, 0.18, 0, frame)
-
-    # ── TOP BAR ─────────────────────────────────────────────────────────────
-    # Logo / title
-    cv2.putText(frame, "GESTURE", (12, 34), FONT_BOLD, 0.8, CLR_ACCENT, 2)
-    cv2.putText(frame, " + VOICE", (110, 34), FONT_BOLD, 0.8, CLR_VOICE, 2)
-    cv2.putText(frame, "CONTROLLER", (240, 34), FONT_BOLD, 0.8, CLR_WHITE, 2)
-
-    # FPS
-    fps_color = CLR_GREEN if fps > 20 else CLR_ORANGE if fps > 10 else CLR_RED
-    cv2.putText(frame, f"FPS: {fps:2.0f}", (w-210, 36), FONT, 0.65, fps_color, 2)
-
-    # Gesture / Voice toggle indicators
-    g_col = CLR_GREEN if gesture_on else CLR_RED
-    v_col = CLR_GREEN if voice_on   else CLR_RED
-    g_txt = "GESTURE [G]: ON " if gesture_on else "GESTURE [G]: OFF"
-    v_txt = "VOICE [V]: ON " if voice_on   else "VOICE [V]: OFF"
-    cv2.putText(frame, g_txt, (w-540, 22), FONT, 0.52, g_col, 1)
-    cv2.putText(frame, v_txt, (w-540, 44), FONT, 0.52, v_col, 1)
-
-    # ── LEFT PANEL – gesture guide ───────────────────────────────────────────
-    cv2.putText(frame, "GESTURE GUIDE", (8, 76), FONT_BOLD, 0.5, CLR_ACCENT, 1)
-    cv2.line(frame, (8, 82), (252, 82), CLR_ACCENT, 1)
-    for i, (gesture, action) in enumerate(GESTURE_GUIDE):
-        y = 100 + i * 46
-        cv2.putText(frame, gesture,  (8,  y),    FONT, 0.42, CLR_WHITE,  1)
-        cv2.putText(frame, f"→ {action}", (8, y+17), FONT, 0.38, CLR_GREEN, 1)
-
-    # ── RIGHT PANEL – voice command list ─────────────────────────────────────
-    cv2.putText(frame, "VOICE COMMANDS", (w-215, 76), FONT_BOLD, 0.45, CLR_VOICE, 1)
-    cv2.line(frame, (w-215, 82), (w-4, 82), CLR_VOICE, 1)
-    for i, cmd in enumerate(VOICE_GUIDE):
-        y = 100 + i * 30
-        cv2.putText(frame, cmd, (w-212, y), FONT, 0.38, CLR_WHITE, 1)
-
-    # ── BOTTOM STATUS BAR ───────────────────────────────────────────────────
-    # Current gesture
-    cv2.putText(frame, "GESTURE:", (8, h-35), FONT, 0.5, CLR_DIM, 1)
-    cv2.putText(frame, gesture_label, (95, h-35), FONT_BOLD, 0.55, CLR_ACCENT, 1)
-
-    # Divider
-    cv2.line(frame, (w//2, h-58), (w//2, h-4), CLR_DIM, 1)
-
-    # Voice status
-    mic_color  = CLR_GREEN if voice_listening else CLR_DIM
-    mic_symbol = "🎙 LISTENING..." if voice_listening else "🎙 Waiting..."
-    cv2.putText(frame, "VOICE:", (w//2 + 8, h-35), FONT, 0.5, CLR_DIM, 1)
-    cv2.putText(frame, voice_label or "—", (w//2 + 72, h-35), FONT_BOLD, 0.52, CLR_VOICE, 1)
-
-    # Mic pulse indicator
-    if voice_listening:
-        pulse = int(abs(np.sin(frame_count * 0.15)) * 14) + 6
-        cv2.circle(frame, (w-10, h-30), pulse, CLR_GREEN, -1)
-    else:
-        cv2.circle(frame, (w-10, h-30), 5, CLR_DIM, -1)
-
-    # Quit hint
-    cv2.putText(frame, "Q: Quit", (8, h-12), FONT, 0.38, CLR_DIM, 1)
-    cv2.putText(frame, "V: Toggle Voice", (90, h-12), FONT, 0.38, CLR_DIM, 1)
-    cv2.putText(frame, "G: Toggle Gesture", (230, h-12), FONT, 0.38, CLR_DIM, 1)
-
+    if w * H > h * W:                       # too wide -> trim left/right
+        new_w = h * W // H
+        x0 = (w - new_w) // 2
+        frame = frame[:, x0:x0 + new_w]
+    elif w * H < h * W:                     # too tall -> trim top/bottom
+        new_h = w * H // W
+        y0 = (h - new_h) // 2
+        frame = frame[y0:y0 + new_h]
+    if frame.shape[1] != W or frame.shape[0] != H:
+        frame = cv2.resize(frame, (W, H), interpolation=cv2.INTER_AREA)
     return frame
 
 
-def draw_active_zone(frame):
-    """Draw the 'active' camera region where gesture tracking works."""
-    h, w = frame.shape[:2]
-    # Exclude left and right panels
-    x1, y1 = 264, 60
-    x2, y2 = w-224, h-64
-    cv2.rectangle(frame, (x1, y1), (x2, y2), CLR_ACCENT, 1)
-    cv2.putText(frame, "ACTIVE ZONE", (x1+4, y1+18), FONT, 0.45, CLR_ACCENT, 1)
+def voice_status(voice_ctrl, active):
+    """Translate the voice controller's state into (state, text) for the HUD."""
+    if not active:
+        return "off", "Voice is off"
+    if voice_ctrl.error:
+        return "error", "Voice problem (see below)"
+    if voice_ctrl.listening:
+        return "listening", "Listening - say a command"
+    return "busy", "Understanding..."
 
 
 def main():
     print("=" * 60)
-    print("  HAND GESTURE + VOICE COMPUTER CONTROLLER")
+    print("  QUARD - hand gesture + voice computer control")
     print("=" * 60)
     print("  Starting camera...")
 
-    cap = cv2.VideoCapture(CAM_INDEX, cv2.CAP_DSHOW)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  CAM_W)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_H)
-    cap.set(cv2.CAP_PROP_FPS, FPS_CAP)
-
-    if not cap.isOpened():
-        print("  ERROR: Cannot open webcam. Check camera index.")
+    cap = open_camera()
+    if cap is None:
+        print("  ERROR: Cannot open the webcam. Close other apps using it, "
+              "or change CAM_INDEX at the top of main.py.")
         sys.exit(1)
 
-    actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    print(f"  Camera: {actual_w}x{actual_h}")
+    gesture_ctrl = None
+    voice_ctrl   = None
+    try:
+        gesture_ctrl = GestureController(W, H)          # works on the resized frame
+        print("  Hand tracking ready.")
 
-    gesture_ctrl = GestureController(actual_w, actual_h)
-    print("  Gesture controller ready.")
+        hud = Hud()
+        voice_ctrl = VoiceController(on_command=hud.voice_hit)
+        voice_ctrl.start()
+        print("  Voice control started (needs a microphone and internet).")
+        print("  The window opens on the help screen - press H or SPACE to begin.")
+        print("=" * 60)
 
-    # Shared state for voice callbacks
-    voice_state = {
-        "last_cmd"  : "—",
-        "listening" : False,
-        "log"       : [],
-    }
-    voice_lock = threading.Lock()
+        # ── state ──────────────────────────────────────────────────────────────
+        gesture_on = True        # G toggle
+        voice_on   = True        # V toggle
+        paused     = False       # SPACE toggle
+        help_open  = True        # shown at start; controls stay off until it is closed
+        first_run  = True
+        show_debug = False       # D toggle: live pinch distances in the bottom bar
+        fps, t_prev, read_fails = 0.0, time.time(), 0
+        was_gesture_active = False
 
-    def on_cmd(cmd):
-        with voice_lock:
-            voice_state["last_cmd"] = cmd
-            voice_state["log"].insert(0, f"▶ {cmd}")
-            if len(voice_state["log"]) > 5:
-                voice_state["log"].pop()
+        cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(WINDOW, W, H)
 
-    def on_listen(state):
-        with voice_lock:
-            voice_state["listening"] = state
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                read_fails += 1
+                if read_fails > 100:
+                    print("  ERROR: the camera stopped delivering frames.")
+                    break
+                time.sleep(0.05)
+                if cv2.waitKey(1) & 0xFF in (ord("q"), ord("Q")):
+                    break
+                continue
+            read_fails = 0
 
-    voice_ctrl = VoiceController(on_command=on_cmd, on_listening=on_listen)
-    voice_ctrl.start()
-    print("  Voice controller started (listening in background).")
-    print("  Press Q in window to quit, V to toggle voice, G to toggle gesture.")
-    print("=" * 60)
+            frame = fit_frame(cv2.flip(frame, 1))       # mirror: moving right moves the cursor right
 
-    gesture_on  = True
-    voice_on    = True
-    frame_count = 0
-    fps         = 0
-    t_prev      = time.time()
+            t_now = time.time()
+            fps   = 0.9 * fps + 0.1 * (1.0 / max(t_now - t_prev, 1e-6))
+            t_prev = t_now
 
-    cv2.namedWindow("Gesture + Voice Controller", cv2.WINDOW_NORMAL)
-    cv2.resizeWindow("Gesture + Voice Controller", actual_w, actual_h)
+            # What is actually allowed to act right now?
+            gesture_active = gesture_on and not paused and not help_open
+            voice_active   = voice_on   and not paused and not help_open
+            voice_ctrl.enabled = voice_active
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            print("  Camera read failed – retrying...")
-            time.sleep(0.05)
-            continue
+            # ── hands ────────────────────────────────────────────────────────────
+            if gesture_active:
+                frame, gesture_label = gesture_ctrl.process(frame)
+                for event in gesture_ctrl.pop_events():
+                    hud.toast(event, ACCENT)
+            else:
+                gesture_label = "Off"
+                if was_gesture_active:
+                    gesture_ctrl.reset()                # never leave the mouse button held down
+            was_gesture_active = gesture_active
 
-        # Mirror for natural feel
-        frame = cv2.flip(frame, 1)
-        frame_count += 1
+            # ── draw ─────────────────────────────────────────────────────────────
+            v_state, v_text = voice_status(voice_ctrl, voice_active)
+            hud.draw(
+                frame,
+                gesture_on=gesture_on, voice_on=voice_on, paused=paused or help_open, fps=fps,
+                gesture_id=gesture_ctrl.gesture_id if gesture_active else "none",
+                gesture_label=gesture_label,
+                hand_count=gesture_ctrl.hand_count if gesture_active else 0,
+                pointer=gesture_ctrl.pointer if gesture_active else None,
+                voice_state=v_state,
+                voice_text=voice_ctrl.error[:60] if v_state == "error" else v_text,
+                heard=voice_ctrl.heard,
+                debug=gesture_ctrl.debug_text if (show_debug and gesture_active) else "",
+            )
+            if help_open:
+                hud.draw_help(frame, first_run)
 
-        # FPS calc
-        t_now = time.time()
-        fps   = 0.9 * fps + 0.1 * (1.0 / max(t_now - t_prev, 1e-6))
-        t_prev = t_now
+            cv2.imshow(WINDOW, frame)
 
-        # Gesture processing
-        gesture_label = "— (paused)"
-        if gesture_on:
-            frame, gesture_label = gesture_ctrl.process(frame)
+            # ── keys ─────────────────────────────────────────────────────────────
+            key = cv2.waitKey(1) & 0xFF
+            if key in (ord("q"), ord("Q")):
+                break
+            elif key == KEY_ESC:
+                if help_open:
+                    help_open = first_run = False
+                else:
+                    break
+            elif key in (ord("h"), ord("H"), KEY_ENTER) or (key == KEY_SPACE and help_open):
+                help_open = not help_open
+                first_run = False
+            elif key == KEY_SPACE:
+                paused = not paused
+                hud.toast("Paused" if paused else "Resumed", RED if paused else GREEN)
+            elif key in (ord("v"), ord("V")):
+                voice_on = not voice_on
+                hud.toast("Voice " + ("ON" if voice_on else "OFF"), VOICE)
+            elif key in (ord("g"), ord("G")):
+                gesture_on = not gesture_on
+                hud.toast("Hands " + ("ON" if gesture_on else "OFF"), ACCENT)
+            elif key in (ord("d"), ord("D")):
+                show_debug = not show_debug
+                hud.toast("Tuning numbers " + ("ON" if show_debug else "OFF"), ACCENT)
 
-        # Voice state read
-        with voice_lock:
-            voice_label     = voice_state["last_cmd"]
-            voice_listening = voice_state["listening"] and voice_on
-
-        # Toggle voice enable
-        voice_ctrl.enabled = voice_on
-
-        # Draw HUD
-        draw_active_zone(frame)
-        frame = draw_hud(
-            frame,
-            gesture_label,
-            voice_label,
-            voice_listening,
-            gesture_on,
-            voice_on,
-            fps,
-            frame_count,
-        )
-
-        cv2.imshow("Gesture + Voice Controller", frame)
-
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord('q') or key == ord('Q') or key == 27:
-            break
-        elif key == ord('v') or key == ord('V'):
-            voice_on = not voice_on
-            print(f"  Voice: {'ON' if voice_on else 'OFF'}")
-        elif key == ord('g') or key == ord('G'):
-            gesture_on = not gesture_on
-            print(f"  Gesture: {'ON' if gesture_on else 'OFF'}")
-
-    print("\n  Shutting down...")
-    gesture_ctrl.release()
-    voice_ctrl.stop()
-    cap.release()
-    cv2.destroyAllWindows()
-    print("  Done. Goodbye!")
+            # Window closed with the title-bar X button
+            if cv2.getWindowProperty(WINDOW, cv2.WND_PROP_VISIBLE) < 1:
+                break
+    except KeyboardInterrupt:
+        pass
+    finally:
+        print("\n  Shutting down...")
+        if gesture_ctrl is not None:
+            gesture_ctrl.release()
+        if voice_ctrl is not None:
+            voice_ctrl.stop()
+        cap.release()
+        cv2.destroyAllWindows()
+        print("  Done. Goodbye!")
 
 
 if __name__ == "__main__":
